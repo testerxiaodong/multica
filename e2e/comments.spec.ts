@@ -5,6 +5,7 @@ import type { TestApiClient } from "./fixtures";
 test.describe("Comments", () => {
   let api: TestApiClient;
   let issueId: string;
+  let issueIdentifier: string;
   let issueTitle: string;
   let workspaceSlug: string;
 
@@ -13,6 +14,8 @@ test.describe("Comments", () => {
     issueTitle = "E2E Comment Test " + Date.now();
     const issue = await api.createIssue(issueTitle);
     issueId = issue.id;
+    issueIdentifier = issue.identifier;
+    if (!issueIdentifier) throw new Error("Comment fixture has no canonical issue identifier");
     workspaceSlug = await loginAsDefault(page);
   });
 
@@ -23,7 +26,7 @@ test.describe("Comments", () => {
   });
 
   test("can add a comment on an issue", async ({ page }) => {
-    await page.goto(`/${workspaceSlug}/issues/${issueId}`, { waitUntil: "domcontentloaded" });
+    await page.goto(`/${workspaceSlug}/issues/${issueIdentifier}`, { waitUntil: "domcontentloaded" });
     await waitForPageText(page, issueTitle);
 
     // Wait for issue detail to load
@@ -37,14 +40,21 @@ test.describe("Comments", () => {
 
     // Type a comment
     const commentText = "E2E comment " + Date.now();
-    const editor = page
-      .locator('.ProseMirror[data-placeholder="Leave a comment..."], .ProseMirror:has([data-placeholder="Leave a comment..."])')
-      .first();
+    const composer = page.getByTestId("comment-composer");
+    const editor = composer.locator('.ProseMirror[contenteditable="true"]');
     await expect(editor).toBeVisible();
-    await editor.click({ force: true });
     await editor.fill(commentText);
 
+    // The editor publishes its draft on a debounce. Wait for send readiness
+    // before submitting, then verify the server accepted the comment.
+    await expect(composer.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+    const saved = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === `/api/issues/${issueId}/comments` &&
+      response.request().method() === "POST" && response.status() === 201,
+    );
     await page.keyboard.press("ControlOrMeta+Enter");
+    await saved;
+    await expect(editor).toHaveText("");
 
     // Comment should appear in the activity section
     await expect(page.locator(`text=${commentText}`)).toBeVisible({
@@ -53,7 +63,7 @@ test.describe("Comments", () => {
   });
 
   test("comment submit button is disabled when empty", async ({ page }) => {
-    await page.goto(`/${workspaceSlug}/issues/${issueId}`, { waitUntil: "domcontentloaded" });
+    await page.goto(`/${workspaceSlug}/issues/${issueIdentifier}`, { waitUntil: "domcontentloaded" });
     await waitForPageText(page, issueTitle);
 
     await expect(page.locator("text=Properties")).toBeVisible();

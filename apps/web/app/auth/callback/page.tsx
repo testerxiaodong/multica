@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { sanitizeNextUrl, useAuthStore } from "@multica/core/auth";
@@ -29,14 +29,36 @@ function CallbackContent() {
   const searchParams = useSearchParams();
   const qc = useQueryClient();
   const loginWithGoogle = useAuthStore((s) => s.loginWithGoogle);
+  const loginWithGitHub = useAuthStore((s) => s.loginWithGitHub);
   const [error, setError] = useState<CallbackError | null>(null);
   const [desktopToken, setDesktopToken] = useState<string | null>(null);
+  const handledOAuthCallbackRef = useRef(false);
 
   useEffect(() => {
+    if (handledOAuthCallbackRef.current) return;
+    handledOAuthCallbackRef.current = true;
+
+    const state = searchParams.get("state") || "";
+    const stateParts = state.split(",");
+    const isGitHub = stateParts.includes("provider:github");
+    if (isGitHub) {
+      const csrfState = stateParts.find((part) => part.startsWith("csrf:"))?.slice(5) || "";
+      let expectedState = "";
+      try {
+        expectedState = window.sessionStorage.getItem("multica_github_oauth_state") || "";
+        window.sessionStorage.removeItem("multica_github_oauth_state");
+      } catch {
+        // A storage-disabled browser cannot safely complete GitHub OAuth.
+      }
+      if (!csrfState || !expectedState || csrfState !== expectedState) {
+        setError({ kind: "login_failed" });
+        return;
+      }
+    }
     const code = searchParams.get("code");
     const errorParam = searchParams.get("error");
     if (errorParam) {
-      authLogger.warn("Google OAuth returned an error parameter", errorParam);
+      authLogger.warn("OAuth provider returned an error parameter", errorParam);
       setError(
         errorParam === "access_denied"
           ? { kind: "access_denied" }
@@ -50,15 +72,13 @@ function CallbackContent() {
       return;
     }
 
-    const state = searchParams.get("state") || "";
-    const stateParts = state.split(",");
     const isDesktop = stateParts.includes("platform:desktop");
     const nextPart = stateParts.find((p) => p.startsWith("next:"));
     // Strip "next:" prefix, then drop anything that isn't a safe relative path
     // so an attacker-controlled `state=next:https://evil` cannot redirect here.
     const nextUrl = sanitizeNextUrl(nextPart ? nextPart.slice(5) : null);
 
-    // CLI callback params — carried across the Google OAuth round-trip so
+    // CLI callback params — carried across the OAuth round-trip so
     // headless/WSL2 `multica login` can receive the JWT after browser-based
     // Google auth completes.
     const cliCallbackPart = stateParts.find((p) => p.startsWith("cli_callback:"));
@@ -80,32 +100,30 @@ function CallbackContent() {
         : null;
 
     if (cliCallback) {
-      // CLI login flow: exchange the Google code for a JWT, then redirect the
+      // CLI login flow: exchange the OAuth code for a JWT, then redirect the
       // token back to the CLI's local HTTP listener (e.g. WSL2 host).
-      api
-        .googleLogin(code, redirectUri)
+      (isGitHub ? api.githubLogin(code, redirectUri) : api.googleLogin(code, redirectUri))
         .then(({ token }) => {
           redirectToCliCallback(cliCallback, token, cliState);
         })
         .catch((err) => {
-          authLogger.error("CLI Google OAuth callback failed", err);
+          authLogger.error("CLI OAuth callback failed", err);
           setError(callbackErrorFrom(err));
         });
     } else if (isDesktop) {
       // Desktop flow: exchange code for token, then redirect via deep link
-      api
-        .googleLogin(code, redirectUri)
+      (isGitHub ? api.githubLogin(code, redirectUri) : api.googleLogin(code, redirectUri))
         .then(({ token }) => {
           setDesktopToken(token);
           window.location.href = `multica://auth/callback?token=${encodeURIComponent(token)}`;
         })
         .catch((err) => {
-          authLogger.error("Desktop Google OAuth callback failed", err);
+          authLogger.error("Desktop OAuth callback failed", err);
           setError(callbackErrorFrom(err));
         });
     } else {
       // Normal web flow
-      loginWithGoogle(code, redirectUri)
+      (isGitHub ? loginWithGitHub(code, redirectUri) : loginWithGoogle(code, redirectUri))
         .then(async (loggedInUser) => {
           const wsList = await api.listWorkspaces();
           qc.setQueryData(workspaceKeys.list(), wsList);
@@ -151,11 +169,11 @@ function CallbackContent() {
           router.push(resolvePostAuthDestination(wsList, onboarded));
         })
         .catch((err) => {
-          authLogger.error("Web Google OAuth callback failed", err);
+          authLogger.error("Web OAuth callback failed", err);
           setError(callbackErrorFrom(err));
         });
     }
-  }, [searchParams, loginWithGoogle, router, qc]);
+  }, [searchParams, loginWithGoogle, loginWithGitHub, router, qc]);
 
   const errorDescription = (() => {
     if (!error) return null;
@@ -176,6 +194,8 @@ function CallbackContent() {
         return t(($) => $.web.callback.email_not_allowed);
       case "google_account_no_email":
         return t(($) => $.web.callback.google_account_no_email);
+      case "github_account_no_email":
+        return t(($) => $.web.callback.github_account_no_email);
       case "oauth_code_invalid":
         return t(($) => $.web.callback.oauth_code_invalid);
     }

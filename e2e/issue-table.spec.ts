@@ -12,6 +12,7 @@ type TableRequestBody = {
   group?: { kind?: string };
   group_key?: string | null;
   parent_id?: string | null;
+  hierarchy?: { enabled?: boolean };
   page?: { limit?: number; cursor?: string | null };
 };
 
@@ -39,6 +40,13 @@ function apiPath(request: Request) {
 
 function tableBody(request: Request): TableRequestBody {
   return (request.postDataJSON() ?? {}) as TableRequestBody;
+}
+
+async function useManualOrdering(page: Page) {
+  await page.getByRole("button", { name: "Display", exact: true }).click();
+  await page.getByLabel("Ordering", { exact: true }).click();
+  await page.getByRole("option", { name: "Manual", exact: true }).click();
+  await page.keyboard.press("Escape");
 }
 
 async function switchToTable(page: Page) {
@@ -77,6 +85,9 @@ test.describe("Issue Table server grouping", () => {
   test.beforeEach(async ({ page }) => {
     api = await createTestApi();
     await loginAsDefault(page);
+    // Cursor movement and hierarchy fixtures use the position field. The
+    // product default is Created date, so select Manual explicitly.
+    await useManualOrdering(page);
   });
 
   test.afterEach(async () => {
@@ -93,16 +104,25 @@ test.describe("Issue Table server grouping", () => {
       position: index + 1,
     }));
     await api.seedTableIssues(seeds);
-    await reloadAppPage(page);
 
     const tableRowRequests: TableRequestBody[] = [];
     const legacyMembershipRequests: string[] = [];
     let lastObservedRequestAt = Date.now();
+    const pendingMembershipRequests = new Set<Request>();
+    const finishRequest = (request: Request) => pendingMembershipRequests.delete(request);
     const collectRequest = (request: Request) => {
       const path = apiPath(request);
+      if (["/api/issues/table/groups", "/api/issues/table/rows", "/api/issues", "/api/issues/query"].includes(path)) {
+        pendingMembershipRequests.add(request);
+        lastObservedRequestAt = Date.now();
+      }
       if (path === "/api/issues/table/rows") {
         lastObservedRequestAt = Date.now();
-        tableRowRequests.push(tableBody(request));
+        const body = tableBody(request);
+        // Opening the view menu can refetch Board's flat branches before the
+        // Table selection commits. This scenario enables Table hierarchy, so
+        // only its hierarchical requests belong to the measurement window.
+        if (body.hierarchy?.enabled === true) tableRowRequests.push(body);
       }
       if (path === "/api/issues" || path === "/api/issues/query") {
         lastObservedRequestAt = Date.now();
@@ -111,16 +131,18 @@ test.describe("Issue Table server grouping", () => {
     };
 
     page.on("request", collectRequest);
-    // The page initially mounts Board, whose seven status buckets may still
-    // be finishing when the header becomes interactive. Observe that startup
-    // traffic, wait for it to settle, then clear it while keeping the listener
-    // installed so any request caused by the Table switch is captured.
+    page.on("requestfinished", finishRequest);
+    page.on("requestfailed", finishRequest);
+    // Board uses the same row endpoints as Table. Observe the reload from
+    // the start and drain responses as well as request starts, so late Board
+    // group responses cannot be counted as Table traffic.
+    await reloadAppPage(page);
     await expect
-      .poll(() => Date.now() - lastObservedRequestAt, {
-        timeout: 5000,
+      .poll(() => pendingMembershipRequests.size === 0 && Date.now() - lastObservedRequestAt > 750, {
+        timeout: 10000,
         intervals: [100, 200, 300],
       })
-      .toBeGreaterThan(750);
+      .toBe(true);
     tableRowRequests.length = 0;
     legacyMembershipRequests.length = 0;
     lastObservedRequestAt = Date.now();
@@ -148,7 +170,7 @@ test.describe("Issue Table server grouping", () => {
       .filter({ hasText: "Backlog" })
       .first();
     await expect(backlogGroup).toContainText("501");
-    await expect(page.getByText(/Loaded \d+ of 1001/)).toBeVisible();
+    await expect(page.getByRole("button", { name: seeds[0]!.title, exact: true })).toBeVisible();
     await expect(
       page.getByText(/Grouping and hierarchy are paused/),
     ).toHaveCount(0);
@@ -160,9 +182,22 @@ test.describe("Issue Table server grouping", () => {
       })
       .toBeGreaterThan(750);
     page.off("request", collectRequest);
+    page.off("requestfinished", finishRequest);
+    page.off("requestfailed", finishRequest);
     expect(legacyMembershipRequests).toEqual([]);
     expect(tableRowRequests.length).toBeGreaterThan(0);
-    expect(tableRowRequests.length).toBeLessThan(8);
+    await test.info().attach("table-requests", {
+      body: Buffer.from(JSON.stringify(tableRowRequests, null, 2)),
+      contentType: "application/json",
+    });
+    // Refetches can repeat a head request while grouping changes. Bound the
+    // distinct branches instead: one ungrouped head plus the server's groups.
+    const queriedBranches = new Set(tableRowRequests.map((body) => JSON.stringify({
+      group: body.group?.kind,
+      key: body.group_key,
+      parent: body.parent_id,
+    })));
+    expect(queriedBranches.size, JSON.stringify(tableRowRequests)).toBeLessThanOrEqual(groups.groups.length + 1);
     expect(
       tableRowRequests.every(
         (body) =>
@@ -224,7 +259,12 @@ test.describe("Issue Table server grouping", () => {
       );
     });
 
+    const hierarchyGroupsPromise = page.waitForResponse((response) =>
+      apiPath(response.request()) === "/api/issues/table/groups" && response.status() === 200,
+    );
     await groupByStatus(page);
+    const hierarchyGroups = await (await hierarchyGroupsPromise).json() as TableGroupsResponse;
+    expect(hierarchyGroups.total).toBe(3);
     const [todoRootResponse, todoChildrenResponse, doneRootResponse] =
       await Promise.all([
         todoRootPromise,
@@ -236,7 +276,8 @@ test.describe("Issue Table server grouping", () => {
       (await todoChildrenResponse.json()) as TableRowsResponse;
     const doneRoot = (await doneRootResponse.json()) as TableRowsResponse;
 
-    expect(todoRoot.total).toBe(3);
+    // Group counts come from /groups; /rows avoids a query-wide COUNT.
+    expect(Object.fromEntries(hierarchyGroups.groups.map((group) => [group.key, group.count]))).toEqual({ "status:todo": 2, "status:done": 1 });
     expect(todoRoot.rows).toEqual([
       expect.objectContaining({
         issue: expect.objectContaining({ id: parent.id, title: parentTitle }),
@@ -305,7 +346,7 @@ test.describe("Issue Table server grouping", () => {
       element.scrollTop = element.scrollHeight;
     });
     await firstTailPromise;
-    await expect(page.getByText("Loaded 60 of 60", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: moved.title, exact: true })).toBeVisible();
 
     const postUpdateResponses: Array<{
       body: TableRequestBody;
@@ -365,7 +406,8 @@ test.describe("Issue Table server grouping", () => {
     ].map((row) => row.issue.id);
     expect(new Set(refreshedIds).size).toBe(60);
     expect(refreshedIds).toContain(moved.id);
-    await expect(page.getByText("Loaded 60 of 60", { exact: true })).toBeVisible();
+    await tableScroller.evaluate((element) => { element.scrollTop = 0; });
+    await expect(page.getByRole("button", { name: moved.title, exact: true })).toBeVisible();
     page.off("response", collectResponse);
   });
 

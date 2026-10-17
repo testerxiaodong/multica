@@ -36,6 +36,13 @@ interface GoogleAuthConfig {
   state?: string;
 }
 
+interface GitHubAuthConfig {
+  clientId: string;
+  redirectUri: string;
+  /** Opaque state passed through GitHub OAuth. */
+  state?: string;
+}
+
 interface CliCallbackConfig {
   /** Validated localhost callback URL */
   url: string;
@@ -51,12 +58,16 @@ interface LoginPageProps {
   onSuccess: () => void;
   /** Google OAuth config. Omit to disable Google login. */
   google?: GoogleAuthConfig;
+  /** GitHub OAuth config. Omit to disable GitHub login. */
+  github?: GitHubAuthConfig;
   /** CLI callback config for authorizing CLI tools. */
   cliCallback?: CliCallbackConfig;
   /** Called after a token is obtained (e.g. to set cookies). */
   onTokenObtained?: () => void;
   /** Override Google login handler (e.g. desktop opens browser externally). When provided, renders the Google button even if `google` config is omitted. */
   onGoogleLogin?: () => void;
+  /** Override GitHub login handler for shells that open the browser externally. */
+  onGitHubLogin?: () => void;
   /** Slot rendered at the bottom of the sign-in card, below the
    *  Google button. The web shell uses it for a "Prefer the desktop
    *  app?" prompt; desktop omits it (a download prompt inside the app
@@ -102,9 +113,11 @@ export function LoginPage({
   logo,
   onSuccess,
   google,
+  github,
   cliCallback,
   onTokenObtained,
   onGoogleLogin,
+  onGitHubLogin,
   extra,
 }: LoginPageProps) {
   const { t } = useT("auth");
@@ -295,6 +308,26 @@ export function LoginPage({
     });
     if (google.state) params.set("state", google.state);
     window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+  };
+
+  const handleGitHubLogin = () => {
+    if (onGitHubLogin) {
+      onGitHubLogin();
+      return;
+    }
+    if (!github) return;
+    const nonceBytes = new Uint8Array(32);
+    window.crypto.getRandomValues(nonceBytes);
+    const nonce = Array.from(nonceBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    window.sessionStorage.setItem("multica_github_oauth_state", nonce);
+    const state = [`provider:github`, `csrf:${nonce}`, github.state].filter(Boolean).join(",");
+    const params = new URLSearchParams({
+      client_id: github.clientId,
+      redirect_uri: github.redirectUri,
+      scope: "user:email",
+      state,
+    });
+    window.location.href = `https://github.com/login/oauth/authorize?${params}`;
   };
 
   // -------------------------------------------------------------------------
@@ -495,6 +528,26 @@ export function LoginPage({
                 />
               </svg>
               {t(($) => $.signin.google)}
+            </Button>
+          )}
+          {(github || onGitHubLogin) && (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              size="lg"
+              onClick={handleGitHubLogin}
+              disabled={loading}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                className="mr-2 h-4 w-4"
+                fill="currentColor"
+              >
+                <path d="M12 .5C5.6.5.5 5.6.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.6v-2.2c-3.2.7-3.9-1.5-3.9-1.5-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.3-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.7.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.6 18.4.5 12 .5z" />
+              </svg>
+              {t(($) => $.signin.github)}
             </Button>
           )}
           {extra && <div className="w-full pt-1 text-center">{extra}</div>}

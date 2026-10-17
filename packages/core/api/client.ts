@@ -991,6 +991,13 @@ export class ApiClient {
     });
   }
 
+  async githubLogin(code: string, redirectUri: string): Promise<LoginResponse> {
+    return this.fetch("/auth/github", {
+      method: "POST",
+      body: JSON.stringify({ code, redirect_uri: redirectUri }),
+    });
+  }
+
   async logout(): Promise<void> {
     await this.fetch("/auth/logout", { method: "POST" });
   }

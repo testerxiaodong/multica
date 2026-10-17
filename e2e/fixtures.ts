@@ -6,6 +6,7 @@
 
 import "./env";
 import pg from "pg";
+import { randomInt } from "node:crypto";
 
 // `||` (not `??`) so an empty `NEXT_PUBLIC_API_URL=` in .env still falls
 // back to localhost. dotenv sets unset-vs-empty both as "" — treating them
@@ -58,33 +59,16 @@ export class TestApiClient {
     const client = new pg.Client(DATABASE_URL);
     await client.connect();
     try {
-      // Keep each E2E login isolated so previous test runs do not trip the
-      // per-email send-code rate limit.
+      // Fixture setup seeds a one-time code so E2E never sends real mail or
+      // depends on a configured external delivery provider. Login still goes
+      // through the server's verification endpoint.
       await client.query("DELETE FROM verification_code WHERE email = $1", [email]);
-
-      // Step 1: Send verification code
-      const sendRes = await fetch(`${API_BASE}/auth/send-code`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
-      });
-      if (!sendRes.ok) {
-        throw new Error(`send-code failed: ${sendRes.status}`);
-      }
-
-      // Step 2: Read code from database
-      const result = await client.query(
-        "SELECT code FROM verification_code WHERE email = $1 AND used = FALSE AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
-        [email],
+      const code = randomInt(100000, 1000000).toString();
+      await client.query(
+        "INSERT INTO verification_code (email, code, expires_at) VALUES ($1, $2, now() + interval '10 minutes')",
+        [email, code],
       );
-      if (result.rows.length === 0) {
-        throw new Error(`No verification code found for ${email}`);
-      }
 
-      const configuredDevCode = process.env.MULTICA_DEV_VERIFICATION_CODE?.trim();
-      const code = configuredDevCode || result.rows[0].code;
-
-      // Step 3: Verify code to get JWT
       const verifyRes = await fetch(`${API_BASE}/auth/verify-code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

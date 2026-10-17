@@ -8,7 +8,7 @@
  * navigation behavior of `document.title`.
  */
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 
 const route = vi.hoisted(() => ({ pathname: "/acme/issues", search: "" }));
 vi.mock("next/navigation", () => ({
@@ -122,6 +122,22 @@ describe("WorkspaceDocumentTitle", () => {
 
     view.unmount();
     expect(document.title).toBe(SITE_TITLE);
+  });
+
+  it("restores the route title after delayed Next.js metadata overwrites it", async () => {
+    open("/acme/inbox");
+    presentation.title = "Inbox";
+    const view = render(<WorkspaceDocumentTitle />);
+    expect(document.title).toBe("Inbox | Multica");
+
+    // Streamed metadata can arrive after the route's passive effects.
+    document.title = SITE_TITLE;
+    await waitFor(() => expect(document.title).toBe("Inbox | Multica"));
+
+    view.unmount();
+    document.title = "Public page";
+    await Promise.resolve();
+    expect(document.title).toBe("Public page");
   });
 
   it("re-asserts the title when a navigation keeps the same page name", () => {

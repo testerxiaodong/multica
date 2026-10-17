@@ -45,7 +45,20 @@ export function WorkspaceDocumentTitle() {
   // happen to share a title (`/inbox` → `/inbox?view=archived`) has to
   // re-assert it.
   useEffect(() => {
-    document.title = documentTitle;
+    const syncTitle = () => {
+      if (document.title !== documentTitle) document.title = documentTitle;
+    };
+    syncTitle();
+    // Next.js may stream route metadata after this effect has run. Keep the
+    // workspace title authoritative even when that later metadata replaces
+    // the title node; disconnect when the route changes or the shell unmounts.
+    const observer = new MutationObserver(syncTitle);
+    observer.observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => observer.disconnect();
   }, [documentTitle, url]);
 
   // Leaving the dashboard entirely (logout, workspace switcher, landing) drops

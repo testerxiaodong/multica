@@ -4,9 +4,24 @@ import { loginAsDefault, waitForPageText } from "./helpers";
 const ROUTE_CHANGE_TIMEOUT = 30000;
 
 test.describe("Navigation", () => {
+  let requestFailures: Array<{ url: string; error: string | undefined }>;
+
   test.beforeEach(async ({ page }) => {
+    requestFailures = [];
+    page.on("requestfailed", (request) => requestFailures.push({
+      url: request.url(),
+      error: request.failure()?.errorText,
+    }));
     await loginAsDefault(page);
-    await page.waitForLoadState("networkidle");
+  });
+
+  test.afterEach(async ({}, testInfo) => {
+    if (testInfo.status !== testInfo.expectedStatus) {
+      await testInfo.attach("navigation-request-failures", {
+        body: Buffer.from(JSON.stringify(requestFailures, null, 2)),
+        contentType: "application/json",
+      });
+    }
   });
 
   test("sidebar navigation works", async ({ page }) => {
@@ -32,8 +47,8 @@ test.describe("Navigation", () => {
     await expect(page).toHaveURL(/\/settings/, { timeout: ROUTE_CHANGE_TIMEOUT });
     await waitForPageText(page, "Settings");
 
-    await expect(page.getByRole("tab", { name: "General" })).toBeVisible();
-    await expect(page.getByRole("tab", { name: "Members" })).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Settings", exact: true }).getByRole("link", { name: "General", exact: true })).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Settings", exact: true }).getByRole("link", { name: "Members", exact: true })).toBeVisible();
   });
 
   test("agents page shows agent list", async ({ page }) => {

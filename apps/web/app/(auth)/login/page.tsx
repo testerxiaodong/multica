@@ -61,6 +61,7 @@ function LoginPageContent() {
   const qc = useQueryClient();
   const { t } = useT("auth");
   const googleClientId = useConfigStore((state) => state.googleClientId);
+  const githubClientId = useConfigStore((state) => state.githubClientId);
   const user = useAuthStore((s) => s.user);
   const isLoading = useAuthStore((s) => s.isLoading);
   const searchParams = useSearchParams();
@@ -149,12 +150,12 @@ function LoginPageContent() {
     router.push(await resolveLoggedInDestination(qc, onboarded, list));
   };
 
-  // Build Google OAuth state: encode platform, next URL, and CLI callback
+  // Build OAuth state: encode platform, next URL, and CLI callback
   // params so the callback can redirect to the right place after login.
   // CLI callback/state must survive the Google OAuth round-trip so the
   // post-login callback page can redirect the JWT back to the CLI's local
   // HTTP listener (critical for headless / WSL2 environments).
-  const googleState = [
+  const oauthState = [
     platform === "desktop" ? "platform:desktop" : "",
     nextUrl ? `next:${nextUrl}` : "",
     cliCallbackRaw && validateCliCallback(cliCallbackRaw)
@@ -223,7 +224,16 @@ function LoginPageContent() {
           ? {
               clientId: googleClientId,
               redirectUri: `${window.location.origin}/auth/callback`,
-              state: googleState,
+              state: oauthState,
+            }
+          : undefined
+      }
+      github={
+        githubClientId
+          ? {
+              clientId: githubClientId,
+              redirectUri: `${window.location.origin}/auth/callback`,
+              state: oauthState,
             }
           : undefined
       }

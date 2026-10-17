@@ -21,6 +21,9 @@ export function DesktopLoginPage() {
       `${webUrl}/login?platform=desktop`,
     );
   };
+  const handleGitHubLogin = () => {
+    window.desktopAPI.openExternal(`${webUrl}/login?platform=desktop`);
+  };
 
   return (
     <div className="flex h-screen flex-col">
@@ -32,6 +35,7 @@ export function DesktopLoginPage() {
           // Initial workspace navigation happens in routes.tsx via IndexRedirect.
         }}
         onGoogleLogin={handleGoogleLogin}
+        onGitHubLogin={handleGitHubLogin}
       />
     </div>
   );

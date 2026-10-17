@@ -45,6 +45,7 @@ const (
 	googleLoginCodeEmailNotAllowed     = "email_not_allowed"
 	googleLoginCodeAccountWithoutEmail = "google_account_no_email"
 	googleLoginCodeInvalidOAuthCode    = "oauth_code_invalid"
+	githubLoginCodeAccountWithoutEmail = "github_account_no_email"
 )
 
 const devVerificationCodeEnv = "MULTICA_DEV_VERIFICATION_CODE"
@@ -512,7 +513,7 @@ type UpdateMeRequest struct {
 	Timezone *string `json:"timezone"`
 }
 
-type GoogleLoginRequest struct {
+type OAuthCodeLoginRequest struct {
 	Code        string `json:"code"`
 	RedirectURI string `json:"redirect_uri"`
 }
@@ -527,6 +528,23 @@ type googleUserInfo struct {
 	Email   string `json:"email"`
 	Name    string `json:"name"`
 	Picture string `json:"picture"`
+}
+
+type githubTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	Error       string `json:"error"`
+}
+
+type githubUserInfo struct {
+	Login     string `json:"login"`
+	Name      string `json:"name"`
+	AvatarURL string `json:"avatar_url"`
+}
+
+type githubUserEmail struct {
+	Email    string `json:"email"`
+	Primary  bool   `json:"primary"`
+	Verified bool   `json:"verified"`
 }
 
 func writeGoogleLoginActionableError(w http.ResponseWriter, err error) bool {
@@ -556,7 +574,7 @@ func (h *Handler) googleHTTPClient() *http.Client {
 }
 
 func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
-	var req GoogleLoginRequest
+	var req OAuthCodeLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -742,6 +760,180 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 		Token: tokenString,
 		User:  h.userToResponse(user),
 	})
+}
+
+func (h *Handler) githubHTTPClient() *http.Client {
+	if h.githubOAuthHTTPClient != nil {
+		return h.githubOAuthHTTPClient
+	}
+	return http.DefaultClient
+}
+
+// GitHubLogin exchanges a GitHub OAuth code, resolves the account's verified
+// primary email, and issues the same Multica session as other login methods.
+func (h *Handler) GitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req OAuthCodeLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Code == "" {
+		writeError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+	clientID := strings.TrimSpace(os.Getenv("GITHUB_OAUTH_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"))
+	if clientID == "" || clientSecret == "" {
+		writeFeatureDisabled(w, "github_login_not_configured", "GitHub login is not configured")
+		return
+	}
+
+	redirectURI := req.RedirectURI
+	if redirectURI == "" {
+		redirectURI = os.Getenv("GITHUB_OAUTH_REDIRECT_URI")
+	}
+	tokenReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://github.com/login/oauth/access_token", strings.NewReader(url.Values{
+		"code":          {req.Code},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"redirect_uri":  {redirectURI},
+	}.Encode()))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	tokenReq.Header.Set("Accept", "application/json")
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenResp, err := h.githubHTTPClient().Do(tokenReq)
+	if err != nil {
+		slog.Error("github oauth token exchange failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to exchange code with GitHub")
+		return
+	}
+	defer tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK {
+		slog.Error("github oauth token exchange returned error", "status", tokenResp.StatusCode)
+		writeError(w, http.StatusBadGateway, "failed to exchange code with GitHub")
+		return
+	}
+	var tokenBody githubTokenResponse
+	if err := json.NewDecoder(io.LimitReader(tokenResp.Body, 1<<20)).Decode(&tokenBody); err != nil || tokenBody.AccessToken == "" || tokenBody.Error != "" {
+		writeError(w, http.StatusBadGateway, "invalid GitHub token response")
+		return
+	}
+
+	newGitHubRequest := func(endpoint string) (*http.Response, error) {
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Authorization", "Bearer "+tokenBody.AccessToken)
+		request.Header.Set("Accept", "application/vnd.github+json")
+		request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		request.Header.Set("User-Agent", "Multica")
+		return h.githubHTTPClient().Do(request)
+	}
+	userResp, err := newGitHubRequest("https://api.github.com/user")
+	if err != nil {
+		slog.Error("github user profile request failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to fetch user info from GitHub")
+		return
+	}
+	defer userResp.Body.Close()
+	if userResp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "failed to fetch user info from GitHub")
+		return
+	}
+	var ghUser githubUserInfo
+	if err := json.NewDecoder(io.LimitReader(userResp.Body, 1<<20)).Decode(&ghUser); err != nil {
+		writeError(w, http.StatusBadGateway, "invalid GitHub user info")
+		return
+	}
+
+	emailsResp, err := newGitHubRequest("https://api.github.com/user/emails")
+	if err != nil {
+		slog.Error("github email request failed", "error", err)
+		writeError(w, http.StatusBadGateway, "failed to fetch email from GitHub")
+		return
+	}
+	defer emailsResp.Body.Close()
+	if emailsResp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "failed to fetch email from GitHub")
+		return
+	}
+	var emails []githubUserEmail
+	if err := json.NewDecoder(io.LimitReader(emailsResp.Body, 1<<20)).Decode(&emails); err != nil {
+		writeError(w, http.StatusBadGateway, "invalid GitHub email response")
+		return
+	}
+	var email string
+	for _, candidate := range emails {
+		if candidate.Primary && candidate.Verified {
+			email = strings.ToLower(strings.TrimSpace(candidate.Email))
+			break
+		}
+	}
+	if email == "" {
+		writeErrorCode(w, http.StatusBadRequest, githubLoginCodeAccountWithoutEmail, "GitHub did not provide a verified primary email address")
+		return
+	}
+	if auth.IsTemporarilyDisabledUserEmail(email) {
+		writeErrorCode(w, http.StatusForbidden, googleLoginCodeAccountDisabled, auth.TemporarilyDisabledUserError)
+		return
+	}
+	user, isNew, err := h.findOrCreateUser(r.Context(), email)
+	if err != nil {
+		if writeGoogleLoginActionableError(w, err) {
+			return
+		}
+		slog.Warn("github login user lookup or creation failed", append(logger.RequestAttrs(r), "error", err, "email", email)...)
+		writeError(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+	if isNew {
+		evt := analytics.Signup(uuidToString(user.ID), user.Email, signupSourceFromRequest(r))
+		evt.Properties["auth_method"] = "github"
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, evt)
+	}
+
+	needsUpdate := false
+	newName := user.Name
+	newAvatar := user.AvatarUrl
+	profileName := strings.TrimSpace(ghUser.Name)
+	if profileName == "" {
+		profileName = strings.TrimSpace(ghUser.Login)
+	}
+	if profileName != "" && user.Name == strings.Split(email, "@")[0] {
+		newName = profileName
+		needsUpdate = true
+	}
+	if avatar := strings.TrimSpace(ghUser.AvatarURL); avatar != "" && !user.AvatarUrl.Valid {
+		newAvatar = pgtype.Text{String: avatar, Valid: true}
+		needsUpdate = true
+	}
+	if needsUpdate {
+		if updated, err := h.Queries.UpdateUser(r.Context(), db.UpdateUserParams{ID: user.ID, Name: newName, AvatarUrl: newAvatar}); err == nil {
+			user = updated
+		}
+	}
+	tokenString, err := h.issueJWT(user)
+	if err != nil {
+		if writeGoogleLoginActionableError(w, err) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	if err := auth.SetAuthCookies(w, tokenString); err != nil {
+		slog.Warn("failed to set auth cookies", "error", err)
+	}
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(72 * time.Hour)) {
+			http.SetCookie(w, cookie)
+		}
+	}
+	slog.Info("user logged in via github", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
+	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: h.userToResponse(user)})
 }
 
 // IssueCliToken returns a fresh JWT for the authenticated user.
